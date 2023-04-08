@@ -9,18 +9,35 @@ from typing import Annotated
 from dataclasses import dataclass
 
 
-N_EMBED = 1024
-N_ATTN_CONTEXT = 1024
-N_HIDDEN_DIM = 1024
-N_VOCAB = 40478
+EMBED_DIM = 1024
+VOCAB_DIM = 40478  # GPT2 vocab size
+
+TRANSFORMER_N_LAYERS = 8
+TRANSFOMER_OUT_FEATURES = 64
+
+RNN_HIDDEN_DIM = 4096
+RNN_N_LAYERS = 12
+
+SHORT_CONTEXT = 256
+MAX_CONTEXT = 32768
 
 
-@dataclass
+@dataclass(frozen=True)
 class STLRConfig:
-    n_embed: int = N_EMBED
-    n_attn_context: int = N_ATTN_CONTEXT
-    n_hidden_dim: int = N_HIDDEN_DIM
-    attn_cover: int = 2
+    short_context: int = SHORT_CONTEXT
+    max_context: int = MAX_CONTEXT
+
+    embed_dim: int = EMBED_DIM
+    vocab_dim: int = VOCAB_DIM
+
+    transformer_n_layers: int = TRANSFORMER_N_LAYERS
+    transformer_out_features: int = TRANSFOMER_OUT_FEATURES
+
+    rnn_hidden_dim: int = RNN_HIDDEN_DIM
+    rnn_n_layers: int = RNN_N_LAYERS
+
+
+DEFAULT_CONFIG = STLRConfig()
 
 
 # https://arxiv.org/abs/1706.03762
@@ -70,21 +87,22 @@ class Attention(nn.Module):
 
     def forward(
         self,
-        Q: Annotated[torch.Tensor, 'B', 'T', 'K'],
-        K: Annotated[torch.Tensor, 'B', 'T', 'K'],
-        V: Annotated[torch.Tensor, 'B', 'T', 'V'],
-    ) -> Annotated[torch.Tensor, 'B', 'T', 'V']:
-        q_i = rearrange(self.w_q(Q), 'B T (H k) -> B H T k', h=self.num_heads)
-        k_i = rearrange(self.w_k(K), 'B T (H k) -> B H T k', h=self.num_heads)
-        v_i = rearrange(self.w_k(V), 'B T (H k) -> B H T v', h=self.num_heads)
+        Q: Annotated[torch.Tensor, '*B', 'T', 'K'],
+        K: Annotated[torch.Tensor, '*B', 'T', 'K'],
+        V: Annotated[torch.Tensor, '*B', 'T', 'V'],
+    ) -> Annotated[torch.Tensor, '*B', 'T', 'V']:
+        q_i = rearrange(self.w_q(Q), '... B T (H k) -> ... B H T k', h=self.num_heads)
+        k_i = rearrange(self.w_k(K), '... B T (H k) -> ... B H T k', h=self.num_heads)
+        v_i = rearrange(self.w_k(V), '... B T (H k) -> ... B H T v', h=self.num_heads)
 
         # get dotporduct similarity
-        s_qk = einsum('B H i k, B H j k -> B H i j', q_i, k_i) / (q_i.shape[-1]) ** 0.5
+        s_qk = einsum('... B H i k, ... B H j k -> ... B H i j', q_i, k_i)
+        s_qk = s_qk / (q_i.shape[-1]) ** 0.5
         # why softmax over the key dim?
-        attn: Annotated[torch.Tensor, 'B', 'H', 'T', 'T'] = F.softmax(s_qk, dim=-1)
+        attn: Annotated[torch.Tensor, '*B', 'H', 'T', 'T'] = F.softmax(s_qk, dim=-1)
 
-        vals = einsum('B H T i, B H i v -> B H T v', attn, v_i)
-        out = self.w_out(rearrange(vals, 'B H T v ->  B T (H v)'))
+        vals = einsum('... B H T i, ... B H i v -> ... B H T v', attn, v_i)
+        out = self.w_out(rearrange(vals, '... B H T v ->  ... B T (H v)'))
         return out
 
 
@@ -100,7 +118,7 @@ class AttentionLayer(nn.Module):
     skip: bool
 
     def __init__(
-        self, in_features: int = 1024, out_features: int = 512, skip: bool = False
+        self, in_features: int = EMBED_DIM, out_features: int = 512, skip: bool = False
     ) -> None:
         super().__init__()
 
@@ -116,8 +134,8 @@ class AttentionLayer(nn.Module):
         self.norm_ff = nn.LayerNorm(out_features)
 
     def forward(
-        self, x: Annotated[torch.Tensor, 'B', 'T', 'I']
-    ) -> Annotated[torch.Tensor, 'B', 'T', 'O']:
+        self, x: Annotated[torch.Tensor, '*B', 'T', 'I']
+    ) -> Annotated[torch.Tensor, '*B', 'T', 'O']:
         # TODO fix this
         attn = self.attention(x, x, x)
         if self.skip:
@@ -126,7 +144,7 @@ class AttentionLayer(nn.Module):
         return self.norm_ff(x + self.feed_forward(x))
 
 
-class ShortTransformer(nn.Module):
+class ShortContextTransformer(nn.Module):
     n_layers: int
     layers: nn.ModuleList
 
@@ -134,7 +152,10 @@ class ShortTransformer(nn.Module):
     embed_dim: int
 
     def __init__(
-        self, n_layers: int = 6, embed_dim: int = 1024, feature_dim: int = 32
+        self,
+        n_layers: int = TRANSFORMER_N_LAYERS,
+        embed_dim: int = EMBED_DIM,
+        feature_dim: int = TRANSFOMER_OUT_FEATURES,
     ) -> None:
         super().__init__()
 
@@ -150,52 +171,70 @@ class ShortTransformer(nn.Module):
         prev_dim = embed_dim
         for layer in range(1, n_layers):
             out_dim = embed_dim // 2 if layer != n_layers - 1 else feature_dim
+            out_dim = max(out_dim, feature_dim)
             self.layers.append(AttentionLayer(prev_dim, out_dim, skip=False))
             prev_dim = out_dim
 
     def forward(
-        self, x: Annotated[torch.Tensor, 'B', 'T', 'E']
-    ) -> Annotated[torch.Tensor, 'B', 'T', 'F']:
+        self, x: Annotated[torch.Tensor, '*B', 'T', 'E']
+    ) -> Annotated[torch.Tensor, '*B', 'T', 'F']:
         for layer in self.layers:
             x = layer(x)
         return x
 
 
 class RNNLayer(nn.Module):
-    def __init__(self) -> None:
+    hidden_dim: int
+
+    def __init__(self, hidden_dim: int = RNN_HIDDEN_DIM) -> None:
         super().__init__()
+
+        self.hidden_dim = hidden_dim
+
+        self.w_mix = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.u_mix = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.mix_norm = nn.LayerNorm(hidden_dim)
+
+        self.w_out = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.out_norm = nn.LayerNorm(hidden_dim)
 
     def forward(
         self,
-        x: Annotated[torch.Tensor, 'B', 'H'],
-        state: Annotated[torch.Tensor, 'B', 'H'],
-    ) -> tuple[Annotated[torch.Tensor, 'B', 'H'], Annotated[torch.Tensor, 'B', 'H']]:
-        return x, state
+        x: Annotated[torch.Tensor, '*B', 'H'],
+        state: Annotated[torch.Tensor, '*B', 'H'],
+    ) -> tuple[Annotated[torch.Tensor, '*B', 'H'], Annotated[torch.Tensor, '*B', 'H']]:
+        ds = self.w_mix(x) + self.u_mix(state)
+        state = self.mix_norm(state + ds)
+
+        out = self.w_out(state)
+        out = self.out_norm(out)
+
+        return out, state
 
 
-class LongRNN(nn.Module):
+class LongContextRNN(nn.Module):
     feature_dim: int
     context_dim: int
     hidden_dim: int
-    vocab_size: int
+    vocab_dim: int
 
     n_layers: int
     layers: nn.ModuleList
 
     def __init__(
         self,
-        feature_dim: int = 32,
-        context_dim: int = 256,
-        n_layers: int = 8,
-        hidden_dim: int = 1024,
-        vocab_size: int = N_VOCAB,
+        feature_dim: int = TRANSFOMER_OUT_FEATURES,
+        context_dim: int = SHORT_CONTEXT,
+        n_layers: int = RNN_N_LAYERS,
+        hidden_dim: int = RNN_HIDDEN_DIM,
+        vocab_dim: int = VOCAB_DIM,
     ) -> None:
         super().__init__()
 
         self.feature_dim = feature_dim
         self.context_dim = context_dim
         self.hidden_dim = hidden_dim
-        self.vocab_size = vocab_size
+        self.vocab_dim = vocab_dim
 
         self.n_layers = n_layers
 
@@ -204,23 +243,23 @@ class LongRNN(nn.Module):
 
         self.layers = nn.ModuleList([RNNLayer() for _ in range(n_layers)])
 
-        self.to_dist = nn.Linear(hidden_dim, vocab_size, bias=True)
+        self.to_dist = nn.Linear(hidden_dim, vocab_dim, bias=True)
 
     def forward(
         self,
-        x: Annotated[torch.Tensor, 'B', 'T', 'F'],
-        state: Annotated[torch.Tensor, 'B', 'H', 'L'],
+        x: Annotated[torch.Tensor, '*B', 'T', 'F'],
+        state: Annotated[torch.Tensor, '*B', 'H', 'L'],
     ) -> tuple[
-        Annotated[torch.Tensor, 'B', 'V'], Annotated[torch.Tensor, 'B', 'H', 'L']
+        Annotated[torch.Tensor, '*B', 'V'], Annotated[torch.Tensor, '*B', 'H', 'L']
     ]:
         assert x.shape[-1] == self.feature_dim
         assert x.shape[-2] == self.context_dim
 
-        hidden = self.to_hidden(rearrange(x, 'B T F -> B (T F)'))
+        hidden = self.to_hidden(rearrange(x, '... B T F -> ... B (T F)'))
         hidden = self.in_norm(hidden)
 
         for id, layer in enumerate(self.layers):
-            hidden, state[:, :, id] = layer(hidden, state[:, :, id])
+            hidden, state[:, :, id, :] = layer(hidden, state[:, :, id, :])
 
         dist = self.to_dist(hidden)
         dist = F.softmax(dist, dim=-1)
@@ -230,7 +269,59 @@ class LongRNN(nn.Module):
 class STLR(nn.Module):
     config: STLRConfig
 
-    def __init__(self, config: STLRConfig | None = None) -> None:
-        if config is None:
-            config = STLRConfig()
+    short_transformer: ShortContextTransformer
+    long_rnn: LongContextRNN
+
+    def __init__(self, config: STLRConfig = DEFAULT_CONFIG) -> None:
+        super().__init__()
+
         self.config = config
+
+        self.short_transformer = ShortContextTransformer(
+            n_layers=config.transformer_n_layers,
+            embed_dim=config.embed_dim,
+            feature_dim=config.transformer_out_features,
+        )
+        self.long_rnn = LongContextRNN(
+            feature_dim=config.transformer_out_features,
+            context_dim=config.short_context,
+            n_layers=config.rnn_n_layers,
+            hidden_dim=config.rnn_hidden_dim,
+            vocab_dim=config.vocab_dim,
+        )
+
+    def forward(
+        self,
+        x: Annotated[torch.Tensor, '*B', 'M', 'E'],
+    ) -> Annotated[torch.Tensor, '*B', 'V']:
+        T = self.config.short_context
+        B = x.shape[:-2]
+        M = x.shape[-2]
+        assert M <= self.config.max_context
+        assert M % T == 0  # TODO left pad to multiple of T (independent across batch)
+
+        x_batched = rearrange(x, '... B (N T) E -> ... B N T E', T=T)
+        N = x_batched.shape[-2]
+
+        # run short transformers in parallel
+        x_rnn: Annotated[torch.Tensor, '*B', 'N', 'T', 'F']
+        x_rnn = self.short_transformer(x_batched)
+
+        # initialize state
+        state_shape = (*B, self.long_rnn.hidden_dim, self.long_rnn.n_layers)
+        state = torch.zeros(*state_shape)
+
+        for i in range(N):
+            dist, state = self.long_rnn(x_rnn[..., i, :, :], state)
+
+        return dist
+
+
+def main() -> int:
+    n_params = sum(p.numel() for p in STLR().parameters() if p.requires_grad)
+    print(f'Number of parameters: {n_params:,}')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
