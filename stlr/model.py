@@ -316,13 +316,3 @@ class STLR(nn.Module):
             dist, state = self.long_rnn(x_rnn[..., i, :, :], state)
 
         return dist
-
-
-def main() -> int:
-    n_params = sum(p.numel() for p in STLR().parameters() if p.requires_grad)
-    print(f'Number of parameters: {n_params:,}')
-    return 0
-
-
-if __name__ == '__main__':
-    raise SystemExit(main())
