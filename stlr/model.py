@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from einops import rearrange, einsum
-import torch.nn as nn
-import torch
-import torch.nn.functional as F
-
-from typing import Annotated
 from dataclasses import dataclass
+from typing import Annotated
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import einsum
+from einops import rearrange
 
 
 EMBED_DIM = 1024
