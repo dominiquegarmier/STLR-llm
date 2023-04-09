@@ -4,7 +4,7 @@ Work in progress...
 
 # STLR-llm
 
-short-ontext transformer long-context recurrent large language model. Use Tranformers to pick up local bidirectional relationships and RNNs to capture long-range dependencies. Potentally offering the best of both worlds. Including unlimited context.
+short-context transformer long-context recurrent large language model. Use Tranformers to pick up local bidirectional relationships and RNNs to capture long-range dependencies. Potentally offering the best of both worlds. Including unlimited context.
 
 ## Aknowledgements
 
