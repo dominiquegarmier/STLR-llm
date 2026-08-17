@@ -9,7 +9,6 @@ import torch.nn.functional as F
 from einops import einsum
 from einops import rearrange
 
-
 EMBED_DIM = 1024
 VOCAB_DIM = 40478  # GPT2 vocab size
 
